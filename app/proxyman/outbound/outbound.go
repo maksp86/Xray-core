@@ -133,15 +133,24 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 		return common.ErrNoClue
 	}
 	m.access.Lock()
-	defer m.access.Unlock()
+	handler, exists := m.taggedHandler[tag]
+	if !exists {
+		m.access.Unlock()
+		return errors.New("Handler not found: " + tag)
+	}
+
+	if err := handler.Close(); err != nil {
+		errors.LogInfo(ctx, "failed to close handler: ", err)
+	}
 
 	m.tagsCache = &sync.Map{}
-
 	delete(m.taggedHandler, tag)
+
 	if m.defaultHandler != nil && m.defaultHandler.Tag() == tag {
 		m.defaultHandler = nil
 	}
 
+	m.access.Unlock()
 	return nil
 }
 

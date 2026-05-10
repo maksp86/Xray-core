@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"sync"
 
 	"github.com/xtls/xray-core/common/dice"
 
@@ -70,6 +71,28 @@ type Handler struct {
 	udp443          string
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
+	activeAccess    sync.Mutex
+	activeDispatch  map[*activeDispatch]struct{}
+	activeConns     map[stat.Connection]struct{}
+	activeWG        sync.WaitGroup
+	closing         bool
+}
+
+type activeDispatch struct {
+	cancel context.CancelFunc
+	link   *transport.Link
+}
+
+type trackedConnection struct {
+	stat.Connection
+	onClose func()
+	once    sync.Once
+}
+
+func (c *trackedConnection) Close() error {
+	err := c.Connection.Close()
+	c.once.Do(c.onClose)
+	return err
 }
 
 // NewHandler creates a new Handler based on the given configuration.
@@ -81,6 +104,8 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 		outboundManager: v.GetFeature(outbound.ManagerType()).(outbound.Manager),
 		uplinkCounter:   uplinkCounter,
 		downlinkCounter: downlinkCounter,
+		activeDispatch:  make(map[*activeDispatch]struct{}),
+		activeConns:     make(map[stat.Connection]struct{}),
 	}
 
 	if config.SenderSettings != nil {
@@ -176,8 +201,71 @@ func (h *Handler) Tag() string {
 	return h.tag
 }
 
+func (h *Handler) beginDispatch(ctx context.Context, link *transport.Link) (context.Context, func(), bool) {
+	ctx, cancel := context.WithCancel(ctx)
+	active := &activeDispatch{
+		cancel: cancel,
+		link:   link,
+	}
+
+	h.activeAccess.Lock()
+	if h.closing {
+		h.activeAccess.Unlock()
+		cancel()
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+		return nil, nil, false
+	}
+	h.activeDispatch[active] = struct{}{}
+	h.activeWG.Add(1)
+	h.activeAccess.Unlock()
+
+	finish := func() {
+		h.activeAccess.Lock()
+		delete(h.activeDispatch, active)
+		h.activeAccess.Unlock()
+		cancel()
+		h.activeWG.Done()
+	}
+	return ctx, finish, true
+}
+
+func (h *Handler) trackConnection(conn stat.Connection) (stat.Connection, bool) {
+	if conn == nil {
+		return nil, false
+	}
+
+	var tracked *trackedConnection
+	tracked = &trackedConnection{
+		Connection: conn,
+		onClose: func() {
+			h.activeAccess.Lock()
+			delete(h.activeConns, tracked)
+			h.activeAccess.Unlock()
+		},
+	}
+
+	h.activeAccess.Lock()
+	if h.closing {
+		h.activeAccess.Unlock()
+		common.Close(conn)
+		return nil, false
+	}
+	h.activeConns[tracked] = struct{}{}
+	h.activeAccess.Unlock()
+
+	return tracked, true
+}
+
 // Dispatch implements proxy.Outbound.Dispatch.
 func (h *Handler) Dispatch(ctx context.Context, link *transport.Link) {
+	var finish func()
+	var ok bool
+	ctx, finish, ok = h.beginDispatch(ctx, link)
+	if !ok {
+		return
+	}
+	defer finish()
 	outbounds := session.OutboundsFromContext(ctx)
 	ob := outbounds[len(outbounds)-1]
 	content := session.ContentFromContext(ctx)
@@ -293,8 +381,12 @@ func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connecti
 					tlsConfig := config.GetTLSConfig(tls.WithDestination(dest))
 					conn = tls.Client(conn, tlsConfig)
 				}
+				trackedConn, ok := h.trackConnection(conn)
+				if !ok {
+					return nil, context.Canceled
+				}
 
-				return h.getStatCouterConnection(conn), nil
+				return h.getStatCouterConnection(trackedConn), nil
 			}
 
 			errors.LogError(ctx, "failed to get outbound handler with tag: ", tag)
@@ -310,10 +402,24 @@ func (h *Handler) Dial(ctx context.Context, dest net.Destination) (stat.Connecti
 	}
 
 	if conn, err := h.getUoTConnection(ctx, dest); err != os.ErrInvalid {
-		return conn, err
+		if err != nil {
+			return conn, err
+		}
+		trackedConn, ok := h.trackConnection(conn)
+		if !ok {
+			return nil, context.Canceled
+		}
+		return trackedConn, nil
 	}
 
 	conn, err := internet.Dial(ctx, dest, h.streamSettings)
+	if err == nil {
+		trackedConn, ok := h.trackConnection(conn)
+		if !ok {
+			return nil, context.Canceled
+		}
+		conn = trackedConn
+	}
 	conn = h.getStatCouterConnection(conn)
 	outbounds := session.OutboundsFromContext(ctx)
 	if outbounds != nil {
@@ -380,9 +486,34 @@ func (h *Handler) Start() error {
 
 // Close implements common.Closable.
 func (h *Handler) Close() error {
-	common.Close(h.mux)
-	common.Close(h.proxy)
-	return nil
+	h.activeAccess.Lock()
+	h.closing = true
+	activeDispatches := make([]*activeDispatch, 0, len(h.activeDispatch))
+	for active := range h.activeDispatch {
+		activeDispatches = append(activeDispatches, active)
+	}
+	activeConns := make([]stat.Connection, 0, len(h.activeConns))
+	for conn := range h.activeConns {
+		activeConns = append(activeConns, conn)
+	}
+	h.activeAccess.Unlock()
+
+	for _, active := range activeDispatches {
+		active.cancel()
+		common.Interrupt(active.link.Reader)
+		common.Interrupt(active.link.Writer)
+	}
+	for _, conn := range activeConns {
+		common.Close(conn)
+	}
+
+	h.activeWG.Wait()
+
+	var errs []error
+	errs = append(errs, common.Close(h.mux))
+	errs = append(errs, common.Close(h.xudp))
+	errs = append(errs, common.Close(h.proxy))
+	return errors.Combine(errs...)
 }
 
 // SenderSettings implements outbound.Handler.

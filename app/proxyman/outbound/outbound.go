@@ -132,26 +132,32 @@ func (m *Manager) RemoveHandler(ctx context.Context, tag string) error {
 	if tag == "" {
 		return common.ErrNoClue
 	}
-	m.access.Lock()
+
+	m.access.RLock()
 	handler, exists := m.taggedHandler[tag]
+	m.access.RUnlock()
 	if !exists {
-		m.access.Unlock()
 		return errors.New("Handler not found: " + tag)
 	}
 
-	if err := handler.Close(); err != nil {
-		errors.LogInfo(ctx, "failed to close handler: ", err)
+	closeErr := handler.Close()
+	if closeErr != nil {
+		errors.LogInfo(ctx, "failed to close handler: ", closeErr)
 	}
 
-	m.tagsCache = &sync.Map{}
-	delete(m.taggedHandler, tag)
+	m.access.Lock()
+	defer m.access.Unlock()
 
-	if m.defaultHandler != nil && m.defaultHandler.Tag() == tag {
+	if m.taggedHandler[tag] == handler {
+		m.tagsCache = &sync.Map{}
+		delete(m.taggedHandler, tag)
+	}
+
+	if m.defaultHandler == handler {
 		m.defaultHandler = nil
 	}
 
-	m.access.Unlock()
-	return nil
+	return closeErr
 }
 
 // ListHandlers implements outbound.Manager.

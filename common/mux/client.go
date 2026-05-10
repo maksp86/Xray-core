@@ -27,6 +27,13 @@ type ClientManager struct {
 	Picker  WorkerPicker
 }
 
+func (m *ClientManager) Close() error {
+	if m == nil {
+		return nil
+	}
+	return common.Close(m.Picker)
+}
+
 func (m *ClientManager) Dispatch(ctx context.Context, link *transport.Link) error {
 	for i := 0; i < 16; i++ {
 		worker, err := m.Picker.PickAvailable()
@@ -123,6 +130,23 @@ func (p *IncrementalWorkerPicker) PickAvailable() (*ClientWorker, error) {
 	}
 
 	return worker, err
+}
+
+func (p *IncrementalWorkerPicker) Close() error {
+	p.access.Lock()
+	defer p.access.Unlock()
+
+	var errs []error
+	if p.cleanupTask != nil {
+		errs = append(errs, p.cleanupTask.Close())
+		p.cleanupTask = nil
+	}
+	for _, worker := range p.workers {
+		errs = append(errs, worker.Close())
+	}
+	p.workers = nil
+
+	return errors.Combine(errs...)
 }
 
 type ClientWorkerFactory interface {
